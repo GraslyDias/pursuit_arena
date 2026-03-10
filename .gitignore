@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+runs/
+sandbox_map.json
+*.ipynb_checkpoints/
+
