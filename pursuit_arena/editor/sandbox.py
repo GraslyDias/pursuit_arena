@@ -240,6 +240,9 @@ class SandboxApp:
     def draw(self) -> None:
         self.screen.fill((255, 255, 255))
 
+        # Semi-transparent FOV overlay surface
+        fov_surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+
         # Draw walls
         for wall in self.state.walls:
             if len(wall.points) >= 2:
@@ -251,6 +254,21 @@ class SandboxApp:
 
         # Draw police
         for p in self.state.police_agents:
+            # FOV triangle (yellow, low opacity)
+            half_fov_rad = math.radians(p.fov_angle / 2.0)
+            left_dir = p.direction - half_fov_rad
+            right_dir = p.direction + half_fov_rad
+            p0 = p.position
+            p1 = (
+                p0[0] + math.cos(left_dir) * p.vision_range,
+                p0[1] + math.sin(left_dir) * p.vision_range,
+            )
+            p2 = (
+                p0[0] + math.cos(right_dir) * p.vision_range,
+                p0[1] + math.sin(right_dir) * p.vision_range,
+            )
+            pygame.draw.polygon(fov_surface, (255, 255, 0, 80), [p0, p1, p2])
+
             pygame.draw.circle(self.screen, (0, 0, 255), (int(p.position[0]), int(p.position[1])), int(p.radius))
             # Draw facing direction
             end = (
@@ -258,6 +276,9 @@ class SandboxApp:
                 p.position[1] + math.sin(p.direction) * (p.radius * 2),
             )
             pygame.draw.line(self.screen, (0, 0, 180), p.position, end, 2)
+
+        # Blit FOV overlay on top
+        self.screen.blit(fov_surface, (0, 0))
 
         # Draw enemies
         for e in self.state.enemy_agents:

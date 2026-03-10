@@ -71,6 +71,30 @@ class ChaseEscapeEnv(gym.Env):
         self._rng = random.Random(seed)
 
     # ------------------------------------------------------------------
+    # Map / wall generation
+    # ------------------------------------------------------------------
+    def _generate_random_walls(self, state: WorldState, num_strokes: int = 4, stroke_length: float = 250.0) -> None:
+        """
+        Create a few random wall strokes for training.
+
+        This lets the agent learn to navigate with walls without relying
+        on a specific hand-drawn map.
+        """
+        w, h = state.width, state.height
+        for _ in range(num_strokes):
+            # Random start point somewhere in the map (avoid very edges)
+            margin = 50.0
+            x0 = self._rng.uniform(margin, w - margin)
+            y0 = self._rng.uniform(margin, h - margin)
+            angle = self._rng.uniform(-math.pi, math.pi)
+            dx = math.cos(angle) * stroke_length
+            dy = math.sin(angle) * stroke_length
+            x1 = max(0.0, min(w, x0 + dx))
+            y1 = max(0.0, min(h, y0 + dy))
+            stroke = WallStroke(points=[(x0, y0), (x1, y1)], thickness=6)
+            state.walls.append(stroke)
+
+    # ------------------------------------------------------------------
     # Gym API
     # ------------------------------------------------------------------
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
@@ -83,6 +107,9 @@ class ChaseEscapeEnv(gym.Env):
         self.state.enemy_agents.clear()
         self.state.walls.clear()
         self.steps = 0
+
+        # Random training walls
+        self._generate_random_walls(self.state)
 
         # Random spawn positions away from edges
         margin = 100.0
@@ -272,6 +299,9 @@ class ChaseEscapeEnv(gym.Env):
         screen = self._pygame_screen
         screen.fill((255, 255, 255))
 
+        # Semi-transparent FOV overlay
+        fov_surface = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
+
         # Draw walls
         for wall in self.state.walls:
             if len(wall.points) >= 2:
@@ -280,8 +310,27 @@ class ChaseEscapeEnv(gym.Env):
         police = self.state.police_agents[0]
         enemy = self.state.enemy_agents[0]
 
+        # FOV triangle (yellow, low opacity)
+        half_fov_rad = math.radians(police.fov_angle / 2.0)
+        left_dir = police.direction - half_fov_rad
+        right_dir = police.direction + half_fov_rad
+        p0 = police.position
+        p1 = (
+            p0[0] + math.cos(left_dir) * police.vision_range,
+            p0[1] + math.sin(left_dir) * police.vision_range,
+        )
+        p2 = (
+            p0[0] + math.cos(right_dir) * police.vision_range,
+            p0[1] + math.sin(right_dir) * police.vision_range,
+        )
+        pygame.draw.polygon(fov_surface, (255, 255, 0, 80), [p0, p1, p2])
+
+        # Draw agents
         pygame.draw.circle(screen, (0, 0, 255), (int(police.position[0]), int(police.position[1])), int(police.radius))
         pygame.draw.circle(screen, (255, 0, 0), (int(enemy.position[0]), int(enemy.position[1])), int(enemy.radius))
+
+        # Blit FOV overlay
+        screen.blit(fov_surface, (0, 0))
 
         pygame.display.flip()
         if self._pygame_clock is not None:

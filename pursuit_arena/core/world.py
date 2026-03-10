@@ -19,6 +19,7 @@ from .geometry import (
     nearest_exit_distance,
     point_in_fov,
     Segment,
+    segment_intersection,
 )
 
 
@@ -30,6 +31,20 @@ def wall_segments_from_strokes(walls: Iterable[WallStroke]) -> List[Segment]:
         for i in range(len(w.points) - 1):
             segments.append(Segment(w.points[i], w.points[i + 1]))
     return segments
+
+
+def _apply_wall_collision(old_pos: Vec2, new_pos: Vec2, wall_segs: List[Segment]) -> Vec2:
+    """
+    Simple collision: if movement segment intersects any wall, stay at old_pos.
+
+    This is conservative but easy to understand and good enough for a first
+    tactical prototype.
+    """
+    move_seg = Segment(old_pos, new_pos)
+    for w in wall_segs:
+        if segment_intersection(move_seg, w) is not None:
+            return old_pos
+    return new_pos
 
 
 def update_world(
@@ -72,24 +87,25 @@ def update_world(
 
         police.direction += angular_delta
         move_vec = angle_to_vector(police.direction)
-        new_pos = (
+        desired_pos = (
             police.position[0] + move_vec[0] * forward_speed,
             police.position[1] + move_vec[1] * forward_speed,
         )
-        # Clamp to world bounds
-        new_pos = clamp_to_bounds(new_pos, width, height)
-        police.position = new_pos
+        # Clamp to world bounds, then apply wall collision
+        desired_pos = clamp_to_bounds(desired_pos, width, height)
+        police.position = _apply_wall_collision(police.position, desired_pos, wall_segs)
 
     # --- Update enemies ---
     for idx, enemy in enumerate(state.enemy_agents):
         if enemy_dirs is not None and idx < len(enemy_dirs):
             enemy.direction = enemy_dirs[idx]
         move_vec = angle_to_vector(enemy.direction)
-        new_pos = (
+        desired_pos = (
             enemy.position[0] + move_vec[0] * enemy.speed,
             enemy.position[1] + move_vec[1] * enemy.speed,
         )
-        enemy.position = new_pos
+        desired_pos = clamp_to_bounds(desired_pos, width, height)
+        enemy.position = _apply_wall_collision(enemy.position, desired_pos, wall_segs)
 
     state.step_count += 1
 
