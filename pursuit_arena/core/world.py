@@ -87,15 +87,22 @@ def update_world(
 
         police.direction += angular_delta
         move_vec = angle_to_vector(police.direction)
+        old_pos = police.position
         desired_pos = (
-            police.position[0] + move_vec[0] * forward_speed,
-            police.position[1] + move_vec[1] * forward_speed,
+            old_pos[0] + move_vec[0] * forward_speed,
+            old_pos[1] + move_vec[1] * forward_speed,
         )
         # Clamp to world bounds, then apply wall collision
         desired_pos = clamp_to_bounds(desired_pos, width, height)
-        police.position = _apply_wall_collision(police.position, desired_pos, wall_segs)
+        new_pos = _apply_wall_collision(old_pos, desired_pos, wall_segs)
+        police.position = new_pos
+        # If blocked by wall (barely moved), nudge rotation so police can turn and get unstuck
+        if distance(old_pos, new_pos) < 0.5:
+            police.direction += 0.12  # ~7° per frame when stuck; next step may succeed
 
     # --- Update enemies ---
+    # Enemy is NOT clamped to map: they can move outside the screen to escape.
+    # Only walls block them. Police stay inside (clamped above).
     for idx, enemy in enumerate(state.enemy_agents):
         if enemy_dirs is not None and idx < len(enemy_dirs):
             enemy.direction = enemy_dirs[idx]
@@ -105,11 +112,12 @@ def update_world(
             old_pos[0] + move_vec[0] * enemy.speed,
             old_pos[1] + move_vec[1] * enemy.speed,
         )
-        desired_pos = clamp_to_bounds(desired_pos, width, height)
+        # Do NOT clamp enemy to bounds — leaving the map counts as escape
         new_pos = _apply_wall_collision(old_pos, desired_pos, wall_segs)
         enemy.position = new_pos
-        # Detect stuck: didn't move (blocked by wall or bounds)
-        enemy.blocked_last_step = distance(old_pos, new_pos) < 0.5
+        # Stuck = still inside map and barely moved (blocked by wall)
+        still_inside = (0 <= new_pos[0] <= width and 0 <= new_pos[1] <= height)
+        enemy.blocked_last_step = still_inside and (distance(old_pos, new_pos) < 0.5)
 
     state.step_count += 1
 

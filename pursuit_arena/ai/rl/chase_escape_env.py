@@ -4,7 +4,9 @@ from __future__ import annotations
 Gymnasium-compatible environment for a single police agent chasing a scripted enemy.
 """
 
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
+import json
 import math
 import random
 
@@ -119,6 +121,9 @@ class ChaseEscapeEnv(gym.Env):
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         if seed is not None:
             self.seed(seed)
+        # Use saved training map if no options given (e.g. from play_model "Save map")
+        if options is None and getattr(self, "training_map_options", None) is not None:
+            options = self.training_map_options
 
         cfg = self.config
         self.state = WorldState(width=cfg.width, height=cfg.height)
@@ -127,19 +132,37 @@ class ChaseEscapeEnv(gym.Env):
         self.state.walls.clear()
         self.steps = 0
 
-        # Random training walls
-        self._generate_random_walls(self.state)
-
-        # Random spawn positions away from edges
+        # Custom layout from options (e.g. from play_model Edit mode), or random
+        opts = options or {}
         margin = 100.0
-        px = self._rng.uniform(margin, cfg.width - margin)
-        py = self._rng.uniform(margin, cfg.height - margin)
-        ex = self._rng.uniform(margin, cfg.width - margin)
-        ey = self._rng.uniform(margin, cfg.height - margin)
+        w, h = cfg.width, cfg.height
+
+        if opts.get("walls") is not None:
+            for w in opts["walls"]:
+                if isinstance(w, WallStroke):
+                    self.state.walls.append(w)
+                else:
+                    points = [tuple(p) for p in w.get("points", [])]
+                    self.state.walls.append(WallStroke(points=points, thickness=int(w.get("thickness", 6))))
+        else:
+            self._generate_random_walls(self.state)
+
+        if opts.get("police_pos") is not None and opts.get("enemy_pos") is not None:
+            px, py = opts["police_pos"]
+            ex, ey = opts["enemy_pos"]
+            police_dir = opts.get("police_dir", 0.0)
+            enemy_dir = opts.get("enemy_dir", math.pi)
+        else:
+            px = self._rng.uniform(margin, w - margin)
+            py = self._rng.uniform(margin, h - margin)
+            ex = self._rng.uniform(margin, w - margin)
+            ey = self._rng.uniform(margin, h - margin)
+            police_dir = self._rng.uniform(-math.pi, math.pi)
+            enemy_dir = self._rng.uniform(-math.pi, math.pi)
 
         police = PoliceAgent(
-            position=(px, py),
-            direction=self._rng.uniform(-math.pi, math.pi),
+            position=(float(px), float(py)),
+            direction=float(police_dir),
             speed=cfg.police_speed,
             radius=cfg.police_radius,
             fov_angle=cfg.police_fov_deg,
@@ -147,8 +170,8 @@ class ChaseEscapeEnv(gym.Env):
             arrest_radius=cfg.police_arrest_radius,
         )
         enemy = EnemyAgent(
-            position=(ex, ey),
-            direction=self._rng.uniform(-math.pi, math.pi),
+            position=(float(ex), float(ey)),
+            direction=float(enemy_dir),
             speed=cfg.enemy_speed,
             radius=cfg.enemy_radius,
         )
@@ -203,27 +226,20 @@ class ChaseEscapeEnv(gym.Env):
 
         reward = 0.0
 
-        # Dense shaping
+        # Police duty: arrest enemy. Enemy goal is to escape (exit screen).
+        # Small reward when police detects enemy (enemy inside FOV triangle / line-of-sight)
         enemy_visible = police_can_see_enemy(police, enemy, self.state.walls)
         if enemy_visible:
-            # Encourage keeping enemy visible and approaching
-            reward += 0.01
+            reward += 0.05  # small reward for keeping enemy in detection (triangle)
 
-        # Distance-based shaping
-        d_prev = distance(police.position, enemy.position)
-        # simple projection for previous step position (approximate)
-        # here we just use current distance; for proper delta you'd track previous.
-        d_now = d_prev
-        if enemy_visible:
-            reward += 0.001 * (1.0 / max(d_now, 1.0))
-
-        # Small negative step cost
-        reward -= 0.001
-
+        # Large reward for arrest; large negative when enemy escapes
         if arrested:
-            reward += 10.0
+            reward += 5.0   # police gets +5 for arresting
         if escaped:
-            reward -= 10.0
+            reward -= 10.0  # police gets -10 when enemy escapes (enemy achieved goal)
+
+        # Small step penalty to encourage efficiency
+        reward -= 0.002
 
         truncated = self.steps >= self.max_steps
         if truncated and not (arrested or escaped):
@@ -369,4 +385,46 @@ class ChaseEscapeEnv(gym.Env):
 def make_env(render_mode: str | None = None, seed: Optional[int] = None) -> ChaseEscapeEnv:
     """Helper for Stable-Baselines3."""
     return ChaseEscapeEnv(render_mode=render_mode, seed=seed)
+
+
+def load_training_map(path: str | Path) -> Dict[str, Any]:
+    """
+    Load a saved map JSON (from play_model "Save map" or sandbox) for training.
+
+    Returns an options dict you can pass to env.reset(options=...).
+    JSON format: width, height, police: [{x, y, direction}], enemies: [{x, y, direction}],
+    walls: [{points: [[x,y],...], thickness}].
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"Training map not found: {p}")
+    data = json.loads(p.read_text())
+    w = data.get("width", 1280)
+    h = data.get("height", 720)
+    police_list = data.get("police", [])
+    enemy_list = data.get("enemies", [])
+    if not police_list or not enemy_list:
+        raise ValueError("Map must have at least one police and one enemy.")
+    p0 = police_list[0]
+    e0 = enemy_list[0]
+    # Support both {"x","y"} and {"x","y","direction"}
+    police_pos = (float(p0["x"]), float(p0["y"]))
+    police_dir = float(p0.get("direction", 0.0))
+    enemy_pos = (float(e0["x"]), float(e0["y"]))
+    enemy_dir = float(e0.get("direction", math.pi))
+    walls = []
+    for wb in data.get("walls", []):
+        pts = wb.get("points", [])
+        if isinstance(pts[0] if pts else None, dict):
+            points = [(float(pt["x"]), float(pt["y"])) for pt in pts]
+        else:
+            points = [(float(pt[0]), float(pt[1])) for pt in pts]
+        walls.append({"points": points, "thickness": int(wb.get("thickness", 6))})
+    return {
+        "walls": walls,
+        "police_pos": police_pos,
+        "police_dir": police_dir,
+        "enemy_pos": enemy_pos,
+        "enemy_dir": enemy_dir,
+    }
 
