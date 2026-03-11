@@ -42,6 +42,9 @@ from ...core.world import compute_enemy_visibility_and_danger, police_can_see_en
 POLICE_REWARD_ARREST: float = 5.0
 POLICE_REWARD_ESCAPE: float = -10.0
 POLICE_REWARD_VISIBLE: float = 0.05
+# Extra shaping: reward moving closer to enemy, penalize moving away.
+POLICE_REWARD_APPROACH: float = 0.02
+POLICE_PENALTY_RETREAT: float = -0.01
 POLICE_PENALTY_WALL_COLLISION: float = -0.05
 POLICE_PENALTY_SPIN: float = -0.01
 POLICE_STEP_PENALTY: float = -0.002
@@ -281,6 +284,16 @@ class ChaseEscapeEnv(gym.Env):
         inside = 0.0 <= police.position[0] <= cfg.width and 0.0 <= police.position[1] <= cfg.height
         if forward > 0.0 and moved_police < 0.5 and inside and not (arrested or escaped):
             reward += POLICE_PENALTY_WALL_COLLISION
+
+        # Extra shaping: reward moving closer to enemy (good path progress),
+        # penalize moving farther away (bad path), when episode is ongoing.
+        if not (arrested or escaped):
+            dist_before = distance(old_police_pos, enemy.position)
+            dist_after = distance(police.position, enemy.position)
+            if dist_after < dist_before:
+                reward += POLICE_REWARD_APPROACH
+            elif dist_after > dist_before:
+                reward += POLICE_PENALTY_RETREAT
 
         # Small extra penalty when police keeps rotating or doing actions without moving
         # (discourages spinning on the spot).
