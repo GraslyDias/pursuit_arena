@@ -843,7 +843,8 @@ class ChaseEscapeEnemyEnv(gym.Env):
         self.render_mode = render_mode
         self.police_model = police_model  # If set, use trained police; else scripted chase
         self.action_space = spaces.Discrete(6)
-        obs_dim = 4 + 4 + 1 + 1 + 4 + 1  # 15
+        # Enemy obs = [ex, ey, cos_dir, sin_dir, rel_px, rel_py, dist_p, dist_exit, 4 wall_rays, t_rem] -> 13 dims
+        obs_dim = 13
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
         self._rng = random.Random(seed)
         self.state: Optional[WorldState] = None
