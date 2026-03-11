@@ -95,15 +95,24 @@ def _score_direction(
     return score
 
 
+def _angle_diff(a: float, b: float) -> float:
+    """Smallest difference between two angles in [-pi, pi]."""
+    d = (a - b) % (2.0 * math.pi)
+    if d > math.pi:
+        d -= 2.0 * math.pi
+    return d
+
+
 def choose_enemy_directions(
     state: WorldState,
-    num_samples: int = 16,
+    num_samples: int = 24,
     config: WorldConfig = DEFAULT_WORLD_CONFIG,
 ) -> List[float]:
     """
     Compute movement direction (angle in radians) for each enemy using sampling.
 
-    This is a pure function and does not modify world state.
+    When the enemy was blocked last step (hit a wall), we sample a full 360°
+    and penalize the current direction so it rotates and finds a way around.
     """
     wall_segs = wall_segments_from_strokes(state.walls)
     directions: List[float] = []
@@ -112,25 +121,45 @@ def choose_enemy_directions(
         best_score = -math.inf
         best_dir = enemy.direction
 
-        # Sample directions around current heading
-        for i in range(num_samples):
-            offset = (i / max(1, num_samples - 1) - 0.5) * math.pi  # sample in +-90deg fan
-            cand_dir = enemy.direction + offset
-            score = _score_direction(
-                cand_dir,
-                enemy,
-                state.police_agents,
-                wall_segs,
-                state.width,
-                state.height,
-                config,
-            )
-            if score > best_score:
-                best_score = score
-                best_dir = cand_dir
+        if enemy.blocked_last_step:
+            # Stuck at wall: sample full circle so we can turn around / try sides
+            for i in range(num_samples):
+                cand_dir = (i / num_samples) * 2.0 * math.pi - math.pi
+                score = _score_direction(
+                    cand_dir,
+                    enemy,
+                    state.police_agents,
+                    wall_segs,
+                    state.width,
+                    state.height,
+                    config,
+                )
+                # Strong penalty for going back in the same blocked direction
+                angle_diff = abs(_angle_diff(cand_dir, enemy.direction))
+                if angle_diff < math.radians(45):
+                    score -= 8.0
+                if score > best_score:
+                    best_score = score
+                    best_dir = cand_dir
+        else:
+            # Normal: sample fan in front (±90°)
+            for i in range(num_samples):
+                offset = (i / max(1, num_samples - 1) - 0.5) * math.pi
+                cand_dir = enemy.direction + offset
+                score = _score_direction(
+                    cand_dir,
+                    enemy,
+                    state.police_agents,
+                    wall_segs,
+                    state.width,
+                    state.height,
+                    config,
+                )
+                if score > best_score:
+                    best_score = score
+                    best_dir = cand_dir
 
-        # Small randomization to avoid deterministic oscillations
-        best_dir += random.uniform(-0.1, 0.1)
+        best_dir += random.uniform(-0.08, 0.08)
         directions.append(best_dir)
 
     return directions

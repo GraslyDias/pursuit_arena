@@ -49,6 +49,7 @@ class EnemyAgent:
     current_target: Tuple[float, float] | None = None
     danger_score: float = 0.0
     last_visible_to_police: bool = False
+    blocked_last_step: bool = False  # True when movement was blocked by wall (did not move)
 
 
 @dataclass

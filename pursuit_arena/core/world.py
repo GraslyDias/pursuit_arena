@@ -100,12 +100,16 @@ def update_world(
         if enemy_dirs is not None and idx < len(enemy_dirs):
             enemy.direction = enemy_dirs[idx]
         move_vec = angle_to_vector(enemy.direction)
+        old_pos = enemy.position
         desired_pos = (
-            enemy.position[0] + move_vec[0] * enemy.speed,
-            enemy.position[1] + move_vec[1] * enemy.speed,
+            old_pos[0] + move_vec[0] * enemy.speed,
+            old_pos[1] + move_vec[1] * enemy.speed,
         )
         desired_pos = clamp_to_bounds(desired_pos, width, height)
-        enemy.position = _apply_wall_collision(enemy.position, desired_pos, wall_segs)
+        new_pos = _apply_wall_collision(old_pos, desired_pos, wall_segs)
+        enemy.position = new_pos
+        # Detect stuck: didn't move (blocked by wall or bounds)
+        enemy.blocked_last_step = distance(old_pos, new_pos) < 0.5
 
     state.step_count += 1
 

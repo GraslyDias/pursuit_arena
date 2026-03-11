@@ -73,26 +73,45 @@ class ChaseEscapeEnv(gym.Env):
     # ------------------------------------------------------------------
     # Map / wall generation
     # ------------------------------------------------------------------
-    def _generate_random_walls(self, state: WorldState, num_strokes: int = 4, stroke_length: float = 250.0) -> None:
+    def _generate_random_walls(
+        self,
+        state: WorldState,
+        num_strokes: int | None = None,
+        stroke_length: float = 220.0,
+    ) -> None:
         """
-        Create a few random wall strokes for training.
+        Create different random wall layouts each episode for training.
 
-        This lets the agent learn to navigate with walls without relying
-        on a specific hand-drawn map.
+        Uses a random number of strokes and sometimes multi-segment (L-shaped)
+        walls so the enemy must rotate and find ways around obstacles.
         """
         w, h = state.width, state.height
+        margin = 60.0
+        if num_strokes is None:
+            num_strokes = self._rng.randint(4, 9)
+
         for _ in range(num_strokes):
-            # Random start point somewhere in the map (avoid very edges)
-            margin = 50.0
+            # Random start point
             x0 = self._rng.uniform(margin, w - margin)
             y0 = self._rng.uniform(margin, h - margin)
-            angle = self._rng.uniform(-math.pi, math.pi)
-            dx = math.cos(angle) * stroke_length
-            dy = math.sin(angle) * stroke_length
-            x1 = max(0.0, min(w, x0 + dx))
-            y1 = max(0.0, min(h, y0 + dy))
-            stroke = WallStroke(points=[(x0, y0), (x1, y1)], thickness=6)
-            state.walls.append(stroke)
+            length = self._rng.uniform(stroke_length * 0.5, stroke_length * 1.2)
+
+            if self._rng.random() < 0.35:
+                # Multi-segment (L or short polyline) so enemy must navigate around corners
+                points = [(x0, y0)]
+                for _ in range(2):
+                    angle = self._rng.uniform(-math.pi, math.pi)
+                    seg_len = length * self._rng.uniform(0.3, 0.7)
+                    x1 = max(0.0, min(w, points[-1][0] + math.cos(angle) * seg_len))
+                    y1 = max(0.0, min(h, points[-1][1] + math.sin(angle) * seg_len))
+                    points.append((x1, y1))
+                state.walls.append(WallStroke(points=points, thickness=6))
+            else:
+                # Single segment
+                angle = self._rng.uniform(-math.pi, math.pi)
+                x1 = max(0.0, min(w, x0 + math.cos(angle) * length))
+                y1 = max(0.0, min(h, y0 + math.sin(angle) * length))
+                state.walls.append(WallStroke(points=[(x0, y0), (x1, y1)], thickness=6))
 
     # ------------------------------------------------------------------
     # Gym API
