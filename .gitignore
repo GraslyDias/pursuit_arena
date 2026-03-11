@@ -4,7 +4,6 @@ __pycache__/
 *.pyo
 *.pyd
 .DS_Store
-runs/
 sandbox_map.json
 *.ipynb_checkpoints/
 
