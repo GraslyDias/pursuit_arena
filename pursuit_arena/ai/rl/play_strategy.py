@@ -1,0 +1,374 @@
+from __future__ import annotations
+
+"""
+Strategy play UI: draw map, place agents, run all 3 models with visual strategy overlays.
+
+Features:
+- Edit mode: draw walls, place police and enemy, clear.
+- Buttons: Edit, Start, Stop, Restart, Save map, Load map.
+- Police: commanded by strategy planner model.
+- Enemy: uses trained enemy model (if available), else scripted.
+- Strategy: chooses high-level actions (chase, block exit, bottleneck, hold, flank).
+- Visualization: police FOV triangle + colored strategy target markers.
+"""
+
+import json
+import math
+from pathlib import Path
+from typing import Any, Dict, List, Tuple
+
+import pygame
+from stable_baselines3 import PPO
+
+from ...core.entities import WallStroke
+from .chase_escape_env import ChaseEscapeStrategyEnv, load_training_map
+
+
+Vec2 = Tuple[float, float]
+
+WIN_W = 1280
+WIN_H = 720
+BAR_H = 40
+BTN_H = 32
+BTN_W = 90
+BTN_MARGIN = 10
+
+TRAINING_MAP_PATH = Path("training_map.json")
+
+
+def _build_options(
+    walls: List[WallStroke],
+    police_pos: Vec2 | None,
+    police_dir: float,
+    enemy_pos: Vec2 | None,
+    enemy_dir: float,
+) -> Dict[str, Any] | None:
+    if police_pos is None or enemy_pos is None:
+        return None
+    return {
+        "walls": [{"points": list(w.points), "thickness": w.thickness} for w in walls],
+        "police_pos": police_pos,
+        "police_dir": police_dir,
+        "enemy_pos": enemy_pos,
+        "enemy_dir": enemy_dir,
+    }
+
+
+def _save_training_map(
+    path: Path,
+    walls: List[WallStroke],
+    police_pos: Vec2 | None,
+    police_dir: float,
+    enemy_pos: Vec2 | None,
+    enemy_dir: float,
+) -> bool:
+    if police_pos is None or enemy_pos is None:
+        return False
+    data = {
+        "width": WIN_W,
+        "height": WIN_H,
+        "police": [{"x": police_pos[0], "y": police_pos[1], "direction": police_dir}],
+        "enemies": [{"x": enemy_pos[0], "y": enemy_pos[1], "direction": enemy_dir}],
+        "walls": [
+            {"points": [[round(x, 1), round(y, 1)] for (x, y) in w.points], "thickness": w.thickness}
+            for w in walls
+        ],
+    }
+    path.write_text(json.dumps(data, indent=2))
+    return True
+
+
+def _load_training_map(path: Path) -> tuple[List[WallStroke], Vec2 | None, float, Vec2 | None, float]:
+    if not path.exists():
+        return [], None, 0.0, None, math.pi
+    data = json.loads(path.read_text())
+    walls: List[WallStroke] = []
+    for wb in data.get("walls", []):
+        pts = wb.get("points", [])
+        if pts and isinstance(pts[0], dict):
+            points = [(float(p["x"]), float(p["y"])) for p in pts]
+        else:
+            points = [(float(p[0]), float(p[1])) for p in pts]
+        walls.append(WallStroke(points=points, thickness=int(wb.get("thickness", 6))))
+    police_pos = police_dir = enemy_pos = enemy_dir = None
+    if data.get("police"):
+        p0 = data["police"][0]
+        police_pos = (float(p0["x"]), float(p0["y"]))
+        police_dir = float(p0.get("direction", 0.0))
+    if data.get("enemies"):
+        e0 = data["enemies"][0]
+        enemy_pos = (float(e0["x"]), float(e0["y"]))
+        enemy_dir = float(e0.get("direction", math.pi))
+    return (
+        walls,
+        police_pos,
+        police_dir if police_dir is not None else 0.0,
+        enemy_pos,
+        enemy_dir if enemy_dir is not None else math.pi,
+    )
+
+
+def main() -> None:
+    log_dir = Path("runs/ppo_chase_escape")
+    enemy_zip = log_dir / "ppo_enemy_escape_final.zip"
+    strategy_zip = log_dir / "ppo_strategy_final.zip"
+
+    if not strategy_zip.exists():
+        raise SystemExit(f"Strategy model not found at {strategy_zip}. Run Step 3 training in the Colab notebook first.")
+
+    enemy_model = PPO.load(str(enemy_zip), device="cpu") if enemy_zip.exists() else None
+    if enemy_model is None:
+        print("Warning: enemy model zip not found, using scripted enemy behaviour.")
+
+    strategy_model = PPO.load(str(strategy_zip), device="cpu")
+
+    env = ChaseEscapeStrategyEnv(render_mode=None, enemy_model=enemy_model)
+
+    pygame.init()
+    screen = pygame.display.set_mode((WIN_W, WIN_H + BAR_H))
+    pygame.display.set_caption("Play Strategy — Edit / Start / Stop / Restart")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("consolas", 14)
+
+    walls: List[WallStroke] = []
+    current_stroke: List[Vec2] = []
+    police_pos: Vec2 | None = None
+    police_dir: float = 0.0
+    enemy_pos: Vec2 | None = None
+    enemy_dir: float = math.pi
+
+    mode = "edit"  # "edit" | "running" | "stopped"
+    saved_layout: Dict[str, Any] | None = None
+    obs = None
+    done = False
+    truncated = False
+
+    by = WIN_H + (BAR_H - BTN_H) // 2
+    button_edit_rect = pygame.Rect(BTN_MARGIN, by, BTN_W, BTN_H)
+    button_start_rect = pygame.Rect(BTN_MARGIN + BTN_W + BTN_MARGIN, by, BTN_W, BTN_H)
+    button_stop_rect = pygame.Rect(BTN_MARGIN + 2 * (BTN_W + BTN_MARGIN), by, BTN_W, BTN_H)
+    button_restart_rect = pygame.Rect(BTN_MARGIN + 3 * (BTN_W + BTN_MARGIN), by, BTN_W, BTN_H)
+    button_clear_rect = pygame.Rect(BTN_MARGIN + 4 * (BTN_W + BTN_MARGIN), by, BTN_W, BTN_H)
+    button_save_rect = pygame.Rect(BTN_MARGIN + 5 * (BTN_W + BTN_MARGIN), by, 88, BTN_H)
+    button_load_rect = pygame.Rect(BTN_MARGIN + 5 * (BTN_W + BTN_MARGIN) + 88 + BTN_MARGIN, by, 88, BTN_H)
+
+    def draw_game_area(source: str) -> None:
+        screen.fill((255, 255, 255), (0, 0, WIN_W, WIN_H))
+        # Escape zone band
+        escape_band = 12
+        escape_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        escape_surf.fill((100, 255, 100, 90), (0, 0, WIN_W, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, WIN_H - escape_band, WIN_W, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, 0, escape_band, WIN_H))
+        escape_surf.fill((100, 255, 100, 90), (WIN_W - escape_band, 0, escape_band, WIN_H))
+        screen.blit(escape_surf, (0, 0))
+
+        if source == "edit":
+            for w in walls:
+                if len(w.points) >= 2:
+                    pygame.draw.lines(screen, (0, 0, 0), False, w.points, w.thickness)
+            if len(current_stroke) >= 2:
+                pygame.draw.lines(screen, (80, 80, 80), False, current_stroke, 4)
+            if police_pos is not None:
+                pygame.draw.circle(screen, (0, 0, 255), (int(police_pos[0]), int(police_pos[1])), 10)
+                end = (police_pos[0] + math.cos(police_dir) * 25, police_pos[1] + math.sin(police_dir) * 25)
+                pygame.draw.line(screen, (0, 0, 180), police_pos, end, 2)
+            if enemy_pos is not None:
+                pygame.draw.circle(screen, (255, 0, 0), (int(enemy_pos[0]), int(enemy_pos[1])), 10)
+        else:
+            s = env.state
+            if s is None:
+                return
+            for w in s.walls:
+                if len(w.points) >= 2:
+                    pygame.draw.lines(screen, (0, 0, 0), False, w.points, w.thickness)
+            if s.police_agents:
+                p = s.police_agents[0]
+                half_fov = math.radians(p.fov_angle / 2.0)
+                p0 = p.position
+                p1 = (p0[0] + math.cos(p.direction - half_fov) * p.vision_range,
+                      p0[1] + math.sin(p.direction - half_fov) * p.vision_range)
+                p2 = (p0[0] + math.cos(p.direction + half_fov) * p.vision_range,
+                      p0[1] + math.sin(p.direction + half_fov) * p.vision_range)
+                fov_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+                pygame.draw.polygon(fov_surf, (255, 255, 0, 80), [p0, p1, p2])
+                screen.blit(fov_surf, (0, 0))
+                pygame.draw.circle(screen, (0, 0, 255), (int(p.position[0]), int(p.position[1])), int(p.radius))
+                end = (p.position[0] + math.cos(p.direction) * 25, p.position[1] + math.sin(p.direction) * 25)
+                pygame.draw.line(screen, (0, 0, 180), p.position, end, 2)
+            if s.enemy_agents:
+                e = s.enemy_agents[0]
+                pygame.draw.circle(screen, (255, 0, 0), (int(e.position[0]), int(e.position[1])), int(e.radius))
+
+            # Strategy overlays: reuse env logic in a simplified way
+            if getattr(env, "last_strategy_action", None) is not None and s.police_agents and s.enemy_agents:
+                a = env.last_strategy_action
+                cfg = env.config
+                w_world, h_world = cfg.width, cfg.height
+                police = s.police_agents[0]
+                enemy = s.enemy_agents[0]
+                from ...core.geometry import distance_to_rect_edges, sub, length, normalize, add, mul
+
+                left, right, top, bottom = distance_to_rect_edges(enemy.position, w_world, h_world)
+                if left <= min(right, top, bottom):
+                    exit_pt: Vec2 = (0.0, enemy.position[1])
+                elif right <= min(left, top, bottom):
+                    exit_pt = (float(w_world), enemy.position[1])
+                elif top <= min(left, right, bottom):
+                    exit_pt = (enemy.position[0], 0.0)
+                else:
+                    exit_pt = (enemy.position[0], float(h_world))
+                bottleneck = ((enemy.position[0] + exit_pt[0]) / 2, (enemy.position[1] + exit_pt[1]) / 2)
+
+                target = None
+                color = (0, 0, 0)
+                if a == 0:
+                    target = enemy.position
+                    color = (0, 120, 255)
+                elif a == 1:
+                    target = exit_pt
+                    color = (0, 200, 0)
+                elif a == 2:
+                    target = bottleneck
+                    color = (255, 140, 0)
+                elif a in (4, 5):
+                    to_p = sub(police.position, enemy.position)
+                    if a == 4:
+                        perp = (-to_p[1], to_p[0])
+                    else:
+                        perp = (to_p[1], -to_p[0])
+                    if length(perp) > 0:
+                        perp_n = normalize(perp)
+                        target = add(enemy.position, mul(perp_n, 80))
+                        color = (160, 32, 240)
+                if target is not None:
+                    pygame.draw.circle(screen, color, (int(target[0]), int(target[1])), 6)
+                    pygame.draw.line(screen, color, police.position, target, 2)
+
+    def draw_bar() -> None:
+        screen.fill((240, 240, 240), (0, WIN_H, WIN_W, BAR_H))
+        for label, rect in [
+            ("Edit", button_edit_rect),
+            ("Start", button_start_rect),
+            ("Stop", button_stop_rect),
+            ("Restart", button_restart_rect),
+            ("Clear", button_clear_rect),
+            ("Save map", button_save_rect),
+            ("Load map", button_load_rect),
+        ]:
+            color = (180, 180, 255) if (label.lower() == mode) else (220, 220, 220)
+            pygame.draw.rect(screen, color, rect)
+            pygame.draw.rect(screen, (0, 0, 0), rect, 1)
+            t = font.render(label, True, (0, 0, 0))
+            screen.blit(t, (rect.x + (rect.w - t.get_width()) // 2, rect.y + (rect.h - t.get_height()) // 2))
+        x = button_load_rect.right + BTN_MARGIN * 2
+        if mode == "edit":
+            hint = "L-click: police  R-click: enemy  Ctrl+drag: wall"
+        elif mode == "running":
+            hint = "Running — click Stop to pause"
+        else:
+            hint = "Stopped — click Restart or Edit to change layout"
+        h = font.render(hint, True, (60, 60, 60))
+        screen.blit(h, (x, WIN_H + (BAR_H - h.get_height()) // 2))
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+                break
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                running = False
+                break
+
+            if event.type == pygame.MOUSEBUTTONDOWN:
+                mx, my = event.pos
+                if my >= WIN_H:
+                    if button_edit_rect.collidepoint(mx, my):
+                        mode = "edit"
+                        done = False
+                        truncated = False
+                    elif button_start_rect.collidepoint(mx, my):
+                        opts = _build_options(walls, police_pos, police_dir, enemy_pos, enemy_dir)
+                        if opts is not None:
+                            saved_layout = opts
+                            obs, _ = env.reset(options=opts)
+                            mode = "running"
+                            done = False
+                            truncated = False
+                    elif button_stop_rect.collidepoint(mx, my):
+                        mode = "stopped"
+                    elif button_restart_rect.collidepoint(mx, my):
+                        if saved_layout is not None:
+                            obs, _ = env.reset(options=saved_layout)
+                            mode = "running"
+                            done = False
+                            truncated = False
+                    elif button_clear_rect.collidepoint(mx, my):
+                        walls.clear()
+                        current_stroke.clear()
+                        police_pos = None
+                        enemy_pos = None
+                    elif button_save_rect.collidepoint(mx, my):
+                        if _save_training_map(TRAINING_MAP_PATH, walls, police_pos, police_dir, enemy_pos, enemy_dir):
+                            saved_layout = _build_options(walls, police_pos, police_dir, enemy_pos, enemy_dir)
+                            print(f"Saved map to {TRAINING_MAP_PATH}")
+                        else:
+                            print("Place police and enemy first, then Save map")
+                    elif button_load_rect.collidepoint(mx, my):
+                        (
+                            walls_loaded,
+                            p_pos,
+                            p_dir,
+                            e_pos,
+                            e_dir,
+                        ) = _load_training_map(TRAINING_MAP_PATH)
+                        walls.clear()
+                        walls.extend(walls_loaded)
+                        police_pos = p_pos
+                        police_dir = p_dir
+                        enemy_pos = e_pos
+                        enemy_dir = e_dir
+                        current_stroke.clear()
+                        print(f"Loaded map from {TRAINING_MAP_PATH}")
+                elif mode == "edit" and my < WIN_H:
+                    mods = pygame.key.get_mods()
+                    if event.button == 1:
+                        if mods & pygame.KMOD_CTRL:
+                            current_stroke = [(mx, my)]
+                        else:
+                            police_pos = (float(mx), float(my))
+                    elif event.button == 3:
+                        enemy_pos = (float(mx), float(my))
+
+            if event.type == pygame.MOUSEMOTION and mode == "edit" and pygame.mouse.get_pressed()[0]:
+                if pygame.key.get_mods() & pygame.KMOD_CTRL and current_stroke:
+                    current_stroke.append(event.pos)
+
+            if event.type == pygame.MOUSEBUTTONUP and mode == "edit" and event.button == 1 and current_stroke:
+                if len(current_stroke) >= 2:
+                    walls.append(WallStroke(points=list(current_stroke)))
+                current_stroke = []
+
+        if mode == "running" and obs is not None:
+            if not (done or truncated):
+                action, _ = strategy_model.predict(obs, deterministic=True)
+                obs, _, done, truncated, _ = env.step(int(action))
+            if done or truncated:
+                mode = "stopped"
+
+        if mode == "edit":
+            draw_game_area("edit")
+        else:
+            draw_game_area("env")
+        draw_bar()
+        pygame.display.flip()
+        clock.tick(60)
+
+    env.close()
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
+

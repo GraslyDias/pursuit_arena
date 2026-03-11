@@ -202,6 +202,7 @@ class ChaseEscapeEnv(gym.Env):
 
         police = self.state.police_agents[0]
         enemy = self.state.enemy_agents[0]
+        old_police_pos = police.position
 
         # Decode discrete action to (forward_speed, angular_delta)
         forward = 0.0
@@ -248,6 +249,12 @@ class ChaseEscapeEnv(gym.Env):
             reward += 5.0   # police gets +5 for arresting
         if escaped:
             reward -= 10.0  # police gets -10 when enemy escapes (enemy achieved goal)
+
+        # Negative reward for colliding with walls (police tries to move but stays almost in place).
+        moved_police = distance(old_police_pos, police.position)
+        inside = 0.0 <= police.position[0] <= cfg.width and 0.0 <= police.position[1] <= cfg.height
+        if forward > 0.0 and moved_police < 0.5 and inside and not (arrested or escaped):
+            reward -= 0.05
 
         # Small step penalty to encourage efficiency
         reward -= 0.002
@@ -587,6 +594,7 @@ class ChaseEscapeStrategyEnv(gym.Env):
         self.steps: int = 0
         self._pygame_screen = None
         self._pygame_clock = None
+        self.last_strategy_action: Optional[int] = None
 
     def seed(self, seed: Optional[int] = None) -> None:
         self._rng = random.Random(seed)
@@ -656,7 +664,11 @@ class ChaseEscapeStrategyEnv(gym.Env):
         assert self.state is not None
         cfg = self.config
         self.steps += 1
-        police_actions = [strategy_action_to_police(self.state, cfg, int(action))]
+        police = self.state.police_agents[0]
+        old_police_pos = police.position
+        a = int(action)
+        self.last_strategy_action = a
+        police_actions = [strategy_action_to_police(self.state, cfg, a)]
         enemy_dirs = [self._enemy_direction()]
         terminated, info = update_world(
             self.state, police_actions=police_actions, enemy_dirs=enemy_dirs, config=cfg,
@@ -669,6 +681,12 @@ class ChaseEscapeStrategyEnv(gym.Env):
             reward += 5.0
         if escaped:
             reward -= 10.0
+        # Penalize strategy when police is effectively colliding with walls (tries to move but is stuck),
+        # except when action is explicit HOLD (3).
+        moved_police = distance(old_police_pos, self.state.police_agents[0].position)
+        inside = 0.0 <= self.state.police_agents[0].position[0] <= cfg.width and 0.0 <= self.state.police_agents[0].position[1] <= cfg.height
+        if a != 3 and moved_police < 0.5 and inside and not (arrested or escaped):
+            reward -= 0.05
         reward -= 0.002
         truncated = self.steps >= self.max_steps
         if truncated and not (arrested or escaped):
@@ -698,6 +716,49 @@ class ChaseEscapeStrategyEnv(gym.Env):
         enemy = self.state.enemy_agents[0]
         pygame.draw.circle(screen, (0, 0, 255), (int(police.position[0]), int(police.position[1])), int(police.radius))
         pygame.draw.circle(screen, (255, 0, 0), (int(enemy.position[0]), int(enemy.position[1])), int(enemy.radius))
+        # Visualize current strategy plan (approximate target point)
+        if self.last_strategy_action is not None:
+            w, h = cfg.width, cfg.height
+            left, right, top, bottom = distance_to_rect_edges(enemy.position, w, h)
+            if left <= min(right, top, bottom):
+                exit_pt: Vec2 = (0.0, enemy.position[1])
+            elif right <= min(left, top, bottom):
+                exit_pt = (float(w), enemy.position[1])
+            elif top <= min(left, right, bottom):
+                exit_pt = (enemy.position[0], 0.0)
+            else:
+                exit_pt = (enemy.position[0], float(h))
+            bottleneck = ((enemy.position[0] + exit_pt[0]) / 2, (enemy.position[1] + exit_pt[1]) / 2)
+            target: Optional[Vec2]
+            color = (0, 0, 0)
+            if self.last_strategy_action == 0:  # chase
+                target = enemy.position
+                color = (0, 120, 255)
+            elif self.last_strategy_action == 1:  # block exit
+                target = exit_pt
+                color = (0, 200, 0)
+            elif self.last_strategy_action == 2:  # bottleneck
+                target = bottleneck
+                color = (255, 140, 0)
+            elif self.last_strategy_action == 3:  # hold
+                target = None
+            elif self.last_strategy_action in (4, 5):  # flanks
+                to_p = sub(police.position, enemy.position)
+                if self.last_strategy_action == 4:
+                    perp = (-to_p[1], to_p[0])
+                else:
+                    perp = (to_p[1], -to_p[0])
+                if length(perp) == 0:
+                    target = None
+                else:
+                    perp_n = normalize(perp)
+                    target = add(enemy.position, mul(perp_n, 80))
+                color = (160, 32, 240)
+            else:
+                target = None
+            if target is not None:
+                pygame.draw.circle(screen, color, (int(target[0]), int(target[1])), 6)
+                pygame.draw.line(screen, color, police.position, target, 2)
         pygame.display.flip()
         if self._pygame_clock:
             self._pygame_clock.tick(60)
@@ -977,6 +1038,9 @@ class ChaseEscapeEnemyEnv(gym.Env):
             reward += 5.0
         if arrested:
             reward -= 5.0
+        # Negative reward when enemy movement was blocked by walls (stuck).
+        if enemy.blocked_last_step and not (escaped or arrested):
+            reward -= 0.05
         reward -= 0.002
         truncated = self.steps >= self.max_steps
         if truncated and not (arrested or escaped):
