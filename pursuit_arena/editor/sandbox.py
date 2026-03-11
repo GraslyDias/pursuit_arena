@@ -240,6 +240,15 @@ class SandboxApp:
     def draw(self) -> None:
         self.screen.fill((255, 255, 255))
 
+        # Escape zone border on all 4 edges (enemy escapes when crossing)
+        escape_band = 12
+        escape_surf = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        escape_surf.fill((100, 255, 100, 90), (0, 0, self.width, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, self.height - escape_band, self.width, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, 0, escape_band, self.height))
+        escape_surf.fill((100, 255, 100, 90), (self.width - escape_band, 0, escape_band, self.height))
+        self.screen.blit(escape_surf, (0, 0))
+
         # Semi-transparent FOV overlay surface
         fov_surface = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
 

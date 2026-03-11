@@ -142,6 +142,15 @@ def main() -> None:
         # Clear game area
         screen.fill((255, 255, 255), (0, 0, WIN_W, WIN_H))
 
+        # Escape zone border on all 4 edges
+        escape_band = 12
+        escape_surf = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        escape_surf.fill((100, 255, 100, 90), (0, 0, WIN_W, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, WIN_H - escape_band, WIN_W, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, 0, escape_band, WIN_H))
+        escape_surf.fill((100, 255, 100, 90), (WIN_W - escape_band, 0, escape_band, WIN_H))
+        screen.blit(escape_surf, (0, 0))
+
         if state_source == "edit":
             for w in walls:
                 if len(w.points) >= 2:

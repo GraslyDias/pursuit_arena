@@ -19,12 +19,19 @@ from ...core.entities import EnemyAgent, PoliceAgent, WallStroke, WorldState
 from ...core.enemy_ai import choose_enemy_directions
 from ...core.geometry import (
     Vec2,
+    add,
     angle_to_vector,
     clamp_to_bounds,
     distance,
+    length,
+    mul,
     nearest_exit_distance,
+    normalize,
+    sub,
     distance_to_rect_edges,
+    vector_to_angle,
 )
+from ...core.police_ai import scripted_police_chase
 from ...core.world import compute_enemy_visibility_and_danger, police_can_see_enemy, update_world
 
 
@@ -160,6 +167,10 @@ class ChaseEscapeEnv(gym.Env):
             police_dir = self._rng.uniform(-math.pi, math.pi)
             enemy_dir = self._rng.uniform(-math.pi, math.pi)
 
+        # Step 1 training: static_enemy=True so enemy never moves; only police is trained to find and arrest
+        static_enemy = opts.get("static_enemy") or getattr(self, "static_enemy", False)
+        enemy_speed = 0.0 if static_enemy else cfg.enemy_speed
+
         police = PoliceAgent(
             position=(float(px), float(py)),
             direction=float(police_dir),
@@ -172,7 +183,7 @@ class ChaseEscapeEnv(gym.Env):
         enemy = EnemyAgent(
             position=(float(ex), float(ey)),
             direction=float(enemy_dir),
-            speed=cfg.enemy_speed,
+            speed=enemy_speed,
             radius=cfg.enemy_radius,
         )
         self.state.police_agents.append(police)
@@ -334,6 +345,15 @@ class ChaseEscapeEnv(gym.Env):
         screen = self._pygame_screen
         screen.fill((255, 255, 255))
 
+        # Escape zone border on all 4 edges
+        escape_band = 12
+        escape_surf = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
+        escape_surf.fill((100, 255, 100, 90), (0, 0, cfg.width, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, cfg.height - escape_band, cfg.width, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, 0, escape_band, cfg.height))
+        escape_surf.fill((100, 255, 100, 90), (cfg.width - escape_band, 0, escape_band, cfg.height))
+        screen.blit(escape_surf, (0, 0))
+
         # Semi-transparent FOV overlay
         fov_surface = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
 
@@ -376,6 +396,652 @@ class ChaseEscapeEnv(gym.Env):
             try:
                 import pygame
 
+                pygame.quit()
+            except ImportError:
+                pass
+            self._pygame_screen = None
+
+
+# -------------------------------------------------------------------------
+# Helper: police observation (for trained police model in enemy env and dual run)
+# -------------------------------------------------------------------------
+
+def get_police_obs(
+    state: WorldState,
+    config: WorldConfig,
+    steps: int = 0,
+    max_steps: int = 600,
+) -> np.ndarray:
+    """Build the same observation vector the police agent sees (for inference with trained model)."""
+    police = state.police_agents[0]
+    enemy = state.enemy_agents[0]
+    w, h = config.width, config.height
+    px = police.position[0] / w
+    py = police.position[1] / h
+    dir_cos = math.cos(police.direction)
+    dir_sin = math.sin(police.direction)
+    visible = police_can_see_enemy(police, enemy, state.walls)
+    enemy_visible_flag = 1.0 if visible else 0.0
+    if visible:
+        rel_x = (enemy.position[0] - police.position[0]) / w
+        rel_y = (enemy.position[1] - police.position[1]) / h
+        dist_e = distance(police.position, enemy.position) / math.hypot(w, h)
+    else:
+        rel_x = rel_y = dist_e = 0.0
+    dist_exit = nearest_exit_distance(police.position, w, h) / max(w, h)
+    left, right, top, bottom = distance_to_rect_edges(police.position, w, h)
+    wall_rays = [left / w, right / w, top / h, bottom / h]
+    remaining_time = 1.0 - (steps / max(1, max_steps))
+    return np.array(
+        [px, py, dir_cos, dir_sin, enemy_visible_flag, rel_x, rel_y, dist_e, dist_exit, *wall_rays, *wall_rays, remaining_time],
+        dtype=np.float32,
+    )
+
+
+def get_enemy_obs(
+    state: WorldState,
+    config: WorldConfig,
+    steps: int = 0,
+    max_steps: int = 600,
+) -> np.ndarray:
+    """Build the same observation vector the enemy agent sees (for inference with trained model)."""
+    police = state.police_agents[0]
+    enemy = state.enemy_agents[0]
+    w, h = config.width, config.height
+    ex = enemy.position[0] / w
+    ey = enemy.position[1] / h
+    dc = math.cos(enemy.direction)
+    ds = math.sin(enemy.direction)
+    rel_px = (police.position[0] - enemy.position[0]) / w
+    rel_py = (police.position[1] - enemy.position[1]) / h
+    dist_p = distance(police.position, enemy.position) / math.hypot(w, h)
+    dist_exit = nearest_exit_distance(enemy.position, w, h) / max(w, h)
+    left, right, top, bottom = distance_to_rect_edges(enemy.position, w, h)
+    wall_rays = [left / w, right / w, top / h, bottom / h]
+    t_rem = 1.0 - (steps / max(1, max_steps))
+    return np.array(
+        [ex, ey, dc, ds, rel_px, rel_py, dist_p, dist_exit, *wall_rays, t_rem],
+        dtype=np.float32,
+    )
+
+
+# -------------------------------------------------------------------------
+# Strategy planner env: 3rd agent – coordinates police (trap, bottleneck, block exit)
+# Team shared rewards; supports 1+ police, 1+ enemy (1v1 for now).
+# -------------------------------------------------------------------------
+
+def get_strategy_obs(
+    state: WorldState,
+    config: WorldConfig,
+    steps: int = 0,
+    max_steps: int = 600,
+) -> np.ndarray:
+    """Global state for strategy planner: police, enemy, exits, team view."""
+    w, h = config.width, config.height
+    police = state.police_agents[0]
+    enemy = state.enemy_agents[0]
+    # Normalized positions
+    px = police.position[0] / w
+    py = police.position[1] / h
+    ex = enemy.position[0] / w
+    ey = enemy.position[1] / h
+    # Police direction
+    dir_cos = math.cos(police.direction)
+    dir_sin = math.sin(police.direction)
+    # Distances
+    d_police_enemy = distance(police.position, enemy.position) / math.hypot(w, h)
+    d_enemy_exit = nearest_exit_distance(enemy.position, w, h) / max(w, h)
+    d_police_exit = nearest_exit_distance(police.position, w, h) / max(w, h)
+    # Which exit is nearest to enemy (left/right/top/bottom)
+    left, right, top, bottom = distance_to_rect_edges(enemy.position, w, h)
+    nearest = min((left, 0), (right, 1), (top, 2), (bottom, 3), key=lambda x: x[0])
+    exit_side = nearest[1] / 3.0  # 0..1
+    # Police edge distances
+    pleft, pright, ptop, pbottom = distance_to_rect_edges(police.position, w, h)
+    wall_rays = [pleft / w, pright / w, ptop / h, pbottom / h]
+    t_rem = 1.0 - (steps / max(1, max_steps))
+    return np.array(
+        [px, py, ex, ey, dir_cos, dir_sin, d_police_enemy, d_enemy_exit, d_police_exit, exit_side, *wall_rays, t_rem],
+        dtype=np.float32,
+    )
+
+
+def strategy_action_to_police(state: WorldState, config: WorldConfig, action: int) -> Tuple[float, float]:
+    """
+    Map strategy discrete action to (forward_speed, angular_delta) for the single police.
+    0=chase enemy, 1=block nearest exit, 2=bottleneck (between enemy and exit), 3=hold, 4=flank left, 5=flank right.
+    """
+    police = state.police_agents[0]
+    enemy = state.enemy_agents[0]
+    w, h = config.width, config.height
+    speed = config.police_speed
+    left, right, top, bottom = distance_to_rect_edges(enemy.position, w, h)
+    # Nearest exit point on boundary (center of that edge)
+    if left <= min(right, top, bottom):
+        exit_pt: Vec2 = (0.0, enemy.position[1])
+    elif right <= min(left, top, bottom):
+        exit_pt = (float(w), enemy.position[1])
+    elif top <= min(left, right, bottom):
+        exit_pt = (enemy.position[0], 0.0)
+    else:
+        exit_pt = (enemy.position[0], float(h))
+    # Bottleneck: midpoint between enemy and exit_pt
+    bottleneck = ((enemy.position[0] + exit_pt[0]) / 2, (enemy.position[1] + exit_pt[1]) / 2)
+    if action == 0:  # chase
+        target = enemy.position
+    elif action == 1:  # block exit
+        target = exit_pt
+    elif action == 2:  # bottleneck
+        target = bottleneck
+    elif action == 3:  # hold
+        return 0.0, 0.0
+    elif action == 4:  # flank left (perpendicular left of enemy-to-police)
+        to_p = sub(police.position, enemy.position)
+        perp = (-to_p[1], to_p[0])
+        perp_n = normalize(perp) if length(perp) > 0 else (1, 0)
+        target = add(enemy.position, mul(perp_n, 80))
+    elif action == 5:  # flank right
+        to_p = sub(police.position, enemy.position)
+        perp = (to_p[1], -to_p[0])
+        perp_n = normalize(perp) if length(perp) > 0 else (1, 0)
+        target = add(enemy.position, mul(perp_n, 80))
+    else:
+        target = enemy.position
+    to_target = sub(target, police.position)
+    if length(to_target) < 1.0:
+        return 0.0, 0.0
+    target_angle = vector_to_angle(to_target)
+    diff = (target_angle - police.direction + math.pi) % (2.0 * math.pi) - math.pi
+    turn = max(-0.15, min(0.15, diff))
+    return speed, turn
+
+
+class ChaseEscapeStrategyEnv(gym.Env):
+    """
+    Strategy planner is the RL agent. Commands police (chase, block exit, bottleneck, hold, flank).
+    Team shared reward: + for arrest, - for escape. Enemy is scripted or loaded model.
+    Saves to ppo_strategy_final.zip (3rd model).
+    """
+
+    metadata = {"render_modes": ["human", "none"], "render_fps": 60}
+
+    def __init__(
+        self,
+        config: WorldConfig | None = None,
+        max_steps: int = 600,
+        render_mode: str | None = None,
+        seed: Optional[int] = None,
+        enemy_model: Optional[Any] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config or DEFAULT_WORLD_CONFIG
+        self.max_steps = max_steps
+        self.render_mode = render_mode
+        self.enemy_model = enemy_model
+        self.action_space = spaces.Discrete(6)  # chase, block, bottleneck, hold, flank_l, flank_r
+        # strategy obs: px,py,ex,ey, dir_cos,dir_sin, d_pe, d_ee, d_pe_exit, exit_side, 4 wall_rays, t_rem
+        obs_dim = 4 + 2 + 3 + 1 + 4 + 1
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
+        self._rng = random.Random(seed)
+        self.state: Optional[WorldState] = None
+        self.steps: int = 0
+        self._pygame_screen = None
+        self._pygame_clock = None
+
+    def seed(self, seed: Optional[int] = None) -> None:
+        self._rng = random.Random(seed)
+
+    def _generate_random_walls(self, state: WorldState) -> None:
+        _tmp = ChaseEscapeEnv(self.config, self.max_steps, None, None)
+        _tmp._rng = self._rng
+        _tmp._generate_random_walls(state)
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        if seed is not None:
+            self.seed(seed)
+        if options is None and getattr(self, "training_map_options", None) is not None:
+            options = self.training_map_options
+        cfg = self.config
+        self.state = WorldState(width=cfg.width, height=cfg.height)
+        self.state.police_agents.clear()
+        self.state.enemy_agents.clear()
+        self.state.walls.clear()
+        self.steps = 0
+        opts = options or {}
+        margin = 100.0
+        w, h = cfg.width, cfg.height
+        if opts.get("walls") is not None:
+            for wb in opts["walls"]:
+                if isinstance(wb, WallStroke):
+                    self.state.walls.append(wb)
+                else:
+                    pts = [tuple(p) for p in wb.get("points", [])]
+                    self.state.walls.append(WallStroke(points=pts, thickness=int(wb.get("thickness", 6))))
+        else:
+            self._generate_random_walls(self.state)
+        if opts.get("police_pos") is not None and opts.get("enemy_pos") is not None:
+            px, py = opts["police_pos"]
+            ex, ey = opts["enemy_pos"]
+            police_dir = opts.get("police_dir", 0.0)
+            enemy_dir = opts.get("enemy_dir", math.pi)
+        else:
+            px = self._rng.uniform(margin, w - margin)
+            py = self._rng.uniform(margin, h - margin)
+            ex = self._rng.uniform(margin, w - margin)
+            ey = self._rng.uniform(margin, h - margin)
+            police_dir = self._rng.uniform(-math.pi, math.pi)
+            enemy_dir = self._rng.uniform(-math.pi, math.pi)
+        self.state.police_agents.append(PoliceAgent(
+            position=(float(px), float(py)), direction=float(police_dir),
+            speed=cfg.police_speed, radius=cfg.police_radius,
+            fov_angle=cfg.police_fov_deg, vision_range=cfg.police_vision_range,
+            arrest_radius=cfg.police_arrest_radius,
+        ))
+        self.state.enemy_agents.append(EnemyAgent(
+            position=(float(ex), float(ey)), direction=float(enemy_dir),
+            speed=cfg.enemy_speed, radius=cfg.enemy_radius,
+        ))
+        compute_enemy_visibility_and_danger(self.state, self.config)
+        return get_strategy_obs(self.state, cfg, self.steps, self.max_steps), {}
+
+    def _enemy_direction(self) -> float:
+        if self.enemy_model is not None and self.state is not None:
+            eo = get_enemy_obs(self.state, self.config, self.steps, self.max_steps)
+            ea, _ = self.enemy_model.predict(eo, deterministic=True)
+            turn = {0: 0.0, 1: 0.0, 2: -0.12, 3: 0.12, 4: -0.12, 5: 0.12}.get(int(ea), 0.0)
+            return self.state.enemy_agents[0].direction + turn
+        return choose_enemy_directions(self.state, config=self.config)[0]
+
+    def step(self, action: int):
+        assert self.state is not None
+        cfg = self.config
+        self.steps += 1
+        police_actions = [strategy_action_to_police(self.state, cfg, int(action))]
+        enemy_dirs = [self._enemy_direction()]
+        terminated, info = update_world(
+            self.state, police_actions=police_actions, enemy_dirs=enemy_dirs, config=cfg,
+        )
+        compute_enemy_visibility_and_danger(self.state, cfg)
+        arrested = info.get("arrested", False)
+        escaped = info.get("escaped", False)
+        reward = 0.0
+        if arrested:
+            reward += 5.0
+        if escaped:
+            reward -= 10.0
+        reward -= 0.002
+        truncated = self.steps >= self.max_steps
+        if truncated and not (arrested or escaped):
+            reward -= 0.5
+        obs = get_strategy_obs(self.state, cfg, self.steps, self.max_steps)
+        return obs, reward, terminated, truncated, {"arrested": arrested, "escaped": escaped}
+
+    def render(self) -> None:
+        if self.render_mode != "human" or self.state is None:
+            return
+        try:
+            import pygame
+        except ImportError:
+            return
+        cfg = self.config
+        if self._pygame_screen is None:
+            pygame.init()
+            self._pygame_screen = pygame.display.set_mode((cfg.width, cfg.height))
+            pygame.display.set_caption("ChaseEscapeStrategyEnv")
+            self._pygame_clock = pygame.time.Clock()
+        screen = self._pygame_screen
+        screen.fill((255, 255, 255))
+        for wall in self.state.walls:
+            if len(wall.points) >= 2:
+                pygame.draw.lines(screen, (0, 0, 0), False, wall.points, wall.thickness)
+        police = self.state.police_agents[0]
+        enemy = self.state.enemy_agents[0]
+        pygame.draw.circle(screen, (0, 0, 255), (int(police.position[0]), int(police.position[1])), int(police.radius))
+        pygame.draw.circle(screen, (255, 0, 0), (int(enemy.position[0]), int(enemy.position[1])), int(enemy.radius))
+        pygame.display.flip()
+        if self._pygame_clock:
+            self._pygame_clock.tick(60)
+
+    def close(self) -> None:
+        if self._pygame_screen is not None:
+            try:
+                import pygame
+                pygame.quit()
+            except ImportError:
+                pass
+            self._pygame_screen = None
+
+
+# -------------------------------------------------------------------------
+# Dual env: run both trained models (step 3 – full run, no training)
+# -------------------------------------------------------------------------
+
+class ChaseEscapeDualEnv:
+    """
+    Run both police and enemy with trained models. No training – just step with (police_action, enemy_action).
+    reset() -> (police_obs, enemy_obs). step(police_action, enemy_action) -> (police_obs, enemy_obs), done, info.
+    """
+
+    def __init__(
+        self,
+        config: WorldConfig | None = None,
+        max_steps: int = 600,
+        seed: Optional[int] = None,
+        options: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.config = config or DEFAULT_WORLD_CONFIG
+        self.max_steps = max_steps
+        self._rng = random.Random(seed)
+        self.options = options
+        self.state: Optional[WorldState] = None
+        self.steps: int = 0
+
+    def _build_state(self) -> None:
+        cfg = self.config
+        opts = self.options or {}
+        margin = 100.0
+        w, h = cfg.width, cfg.height
+        self.state = WorldState(width=w, height=h)
+        if opts.get("walls") is not None:
+            for wb in opts["walls"]:
+                if isinstance(wb, WallStroke):
+                    self.state.walls.append(wb)
+                else:
+                    pts = [tuple(p) for p in wb.get("points", [])]
+                    self.state.walls.append(WallStroke(points=pts, thickness=int(wb.get("thickness", 6))))
+        else:
+            _tmp = ChaseEscapeEnv(self.config, self.max_steps, None, None)
+            _tmp._rng = self._rng
+            _tmp._generate_random_walls(self.state)
+        if opts.get("police_pos") is not None and opts.get("enemy_pos") is not None:
+            px, py = opts["police_pos"]
+            ex, ey = opts["enemy_pos"]
+            police_dir = opts.get("police_dir", 0.0)
+            enemy_dir = opts.get("enemy_dir", math.pi)
+        else:
+            px = self._rng.uniform(margin, w - margin)
+            py = self._rng.uniform(margin, h - margin)
+            ex = self._rng.uniform(margin, w - margin)
+            ey = self._rng.uniform(margin, h - margin)
+            police_dir = self._rng.uniform(-math.pi, math.pi)
+            enemy_dir = self._rng.uniform(-math.pi, math.pi)
+        self.state.police_agents.append(PoliceAgent(
+            position=(float(px), float(py)), direction=float(police_dir),
+            speed=cfg.police_speed, radius=cfg.police_radius,
+            fov_angle=cfg.police_fov_deg, vision_range=cfg.police_vision_range,
+            arrest_radius=cfg.police_arrest_radius,
+        ))
+        self.state.enemy_agents.append(EnemyAgent(
+            position=(float(ex), float(ey)), direction=float(enemy_dir),
+            speed=cfg.enemy_speed, radius=cfg.enemy_radius,
+        ))
+        compute_enemy_visibility_and_danger(self.state, self.config)
+
+    def reset(self) -> Tuple[np.ndarray, np.ndarray]:
+        self._build_state()
+        self.steps = 0
+        return (
+            get_police_obs(self.state, self.config, self.steps, self.max_steps),
+            get_enemy_obs(self.state, self.config, self.steps, self.max_steps),
+        )
+
+    def _decode_police(self, action: int) -> Tuple[float, float]:
+        cfg = self.config
+        f, t = 0.0, 0.0
+        if action == 1: f = cfg.police_speed
+        elif action == 2: t = -0.1
+        elif action == 3: t = 0.1
+        elif action == 4: f, t = cfg.police_speed, -0.1
+        elif action == 5: f, t = cfg.police_speed, 0.1
+        return f, t
+
+    def _decode_enemy(self, action: int) -> float:
+        enemy = self.state.enemy_agents[0]
+        turn = {0: 0.0, 1: 0.0, 2: -0.12, 3: 0.12, 4: -0.12, 5: 0.12}.get(action, 0.0)
+        return enemy.direction + turn
+
+    def step(self, police_action: int, enemy_action: int) -> Tuple[np.ndarray, np.ndarray, bool, bool, Dict[str, Any]]:
+        assert self.state is not None
+        self.steps += 1
+        cfg = self.config
+        police = self.state.police_agents[0]
+        enemy = self.state.enemy_agents[0]
+        police_actions = [self._decode_police(police_action)]
+        enemy_dirs = [self._decode_enemy(enemy_action)]
+        terminated, info = update_world(self.state, police_actions=police_actions, enemy_dirs=enemy_dirs, config=cfg)
+        compute_enemy_visibility_and_danger(self.state, cfg)
+        truncated = self.steps >= self.max_steps
+        po = get_police_obs(self.state, cfg, self.steps, self.max_steps)
+        eo = get_enemy_obs(self.state, cfg, self.steps, self.max_steps)
+        return po, eo, terminated, truncated, info
+
+
+# -------------------------------------------------------------------------
+# Enemy training env: RL agent = enemy (goal: escape), police = scripted or trained model
+# -------------------------------------------------------------------------
+
+class ChaseEscapeEnemyEnv(gym.Env):
+    """
+    Enemy is the RL agent (goal: escape off the map).
+    Police: scripted (chase) if police_model is None; else use trained police_model (step 2).
+    Train enemy and save as ppo_enemy_escape_final.zip.
+    """
+
+    metadata = {"render_modes": ["human", "none"], "render_fps": 60}
+
+    def __init__(
+        self,
+        config: WorldConfig | None = None,
+        max_steps: int = 600,
+        render_mode: str | None = None,
+        seed: Optional[int] = None,
+        police_model: Optional[Any] = None,
+    ) -> None:
+        super().__init__()
+        self.config = config or DEFAULT_WORLD_CONFIG
+        self.max_steps = max_steps
+        self.render_mode = render_mode
+        self.police_model = police_model  # If set, use trained police; else scripted chase
+        self.action_space = spaces.Discrete(6)
+        obs_dim = 4 + 4 + 1 + 1 + 4 + 1  # 15
+        self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(obs_dim,), dtype=np.float32)
+        self._rng = random.Random(seed)
+        self.state: Optional[WorldState] = None
+        self.steps: int = 0
+        self._pygame_screen = None
+        self._pygame_clock = None
+
+    def seed(self, seed: Optional[int] = None) -> None:
+        self._rng = random.Random(seed)
+
+    def _generate_random_walls(self, state: WorldState) -> None:
+        cfg = self.config
+        w, h = state.width, state.height
+        margin = 60.0
+        num_strokes = self._rng.randint(4, 9)
+        stroke_length = 220.0
+        for _ in range(num_strokes):
+            x0 = self._rng.uniform(margin, w - margin)
+            y0 = self._rng.uniform(margin, h - margin)
+            length = self._rng.uniform(stroke_length * 0.5, stroke_length * 1.2)
+            if self._rng.random() < 0.35:
+                points = [(x0, y0)]
+                for _ in range(2):
+                    angle = self._rng.uniform(-math.pi, math.pi)
+                    seg_len = length * self._rng.uniform(0.3, 0.7)
+                    x1 = max(0.0, min(w, points[-1][0] + math.cos(angle) * seg_len))
+                    y1 = max(0.0, min(h, points[-1][1] + math.sin(angle) * seg_len))
+                    points.append((x1, y1))
+                state.walls.append(WallStroke(points=points, thickness=6))
+            else:
+                angle = self._rng.uniform(-math.pi, math.pi)
+                x1 = max(0.0, min(w, x0 + math.cos(angle) * length))
+                y1 = max(0.0, min(h, y0 + math.sin(angle) * length))
+                state.walls.append(WallStroke(points=[(x0, y0), (x1, y1)], thickness=6))
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
+        if seed is not None:
+            self.seed(seed)
+        if options is None and getattr(self, "training_map_options", None) is not None:
+            options = self.training_map_options
+        cfg = self.config
+        self.state = WorldState(width=cfg.width, height=cfg.height)
+        self.state.police_agents.clear()
+        self.state.enemy_agents.clear()
+        self.state.walls.clear()
+        self.steps = 0
+        opts = options or {}
+        margin = 100.0
+        w, h = cfg.width, cfg.height
+        if opts.get("walls") is not None:
+            for wb in opts["walls"]:
+                if isinstance(wb, WallStroke):
+                    self.state.walls.append(wb)
+                else:
+                    pts = [tuple(p) for p in wb.get("points", [])]
+                    self.state.walls.append(WallStroke(points=pts, thickness=int(wb.get("thickness", 6))))
+        else:
+            self._generate_random_walls(self.state)
+        if opts.get("police_pos") is not None and opts.get("enemy_pos") is not None:
+            px, py = opts["police_pos"]
+            ex, ey = opts["enemy_pos"]
+            police_dir = opts.get("police_dir", 0.0)
+            enemy_dir = opts.get("enemy_dir", math.pi)
+        else:
+            px = self._rng.uniform(margin, w - margin)
+            py = self._rng.uniform(margin, h - margin)
+            ex = self._rng.uniform(margin, w - margin)
+            ey = self._rng.uniform(margin, h - margin)
+            police_dir = self._rng.uniform(-math.pi, math.pi)
+            enemy_dir = self._rng.uniform(-math.pi, math.pi)
+        self.state.police_agents.append(PoliceAgent(
+            position=(float(px), float(py)), direction=float(police_dir),
+            speed=cfg.police_speed, radius=cfg.police_radius,
+            fov_angle=cfg.police_fov_deg, vision_range=cfg.police_vision_range,
+            arrest_radius=cfg.police_arrest_radius,
+        ))
+        self.state.enemy_agents.append(EnemyAgent(
+            position=(float(ex), float(ey)), direction=float(enemy_dir),
+            speed=cfg.enemy_speed, radius=cfg.enemy_radius,
+        ))
+        compute_enemy_visibility_and_danger(self.state, self.config)
+        return self._get_obs(), {}
+
+    def _decode_enemy_action(self, action: int) -> float:
+        """Map discrete action to angular delta for enemy direction."""
+        turn = {0: 0.0, 1: 0.0, 2: -0.12, 3: 0.12, 4: -0.12, 5: 0.12}.get(action, 0.0)
+        enemy = self.state.enemy_agents[0]
+        return enemy.direction + turn
+
+    def _decode_police_action(self, action: int) -> Tuple[float, float]:
+        """Map discrete police action to (forward_speed, angular_delta)."""
+        cfg = self.config
+        forward = 0.0
+        turn = 0.0
+        if action == 1:
+            forward = cfg.police_speed
+        elif action == 2:
+            turn = -0.1
+        elif action == 3:
+            turn = 0.1
+        elif action == 4:
+            forward = cfg.police_speed
+            turn = -0.1
+        elif action == 5:
+            forward = cfg.police_speed
+            turn = 0.1
+        return forward, turn
+
+    def step(self, action: int):
+        assert self.state is not None
+        cfg = self.config
+        self.steps += 1
+        police = self.state.police_agents[0]
+        enemy = self.state.enemy_agents[0]
+        if self.police_model is not None:
+            police_obs = get_police_obs(self.state, cfg, self.steps - 1, self.max_steps)
+            police_action, _ = self.police_model.predict(police_obs, deterministic=True)
+            police_actions = [self._decode_police_action(int(police_action))]
+        else:
+            police_actions = [scripted_police_chase(police, enemy)]
+        enemy_dirs = [self._decode_enemy_action(action)]
+        terminated, info = update_world(
+            self.state, police_actions=police_actions, enemy_dirs=enemy_dirs, config=cfg,
+        )
+        compute_enemy_visibility_and_danger(self.state, cfg)
+        arrested = info.get("arrested", False)
+        escaped = info.get("escaped", False)
+        reward = 0.0
+        if escaped:
+            reward += 5.0
+        if arrested:
+            reward -= 5.0
+        reward -= 0.002
+        truncated = self.steps >= self.max_steps
+        if truncated and not (arrested or escaped):
+            reward -= 0.5
+        return self._get_obs(), reward, terminated, truncated, {"arrested": arrested, "escaped": escaped}
+
+    def _get_obs(self) -> np.ndarray:
+        assert self.state is not None
+        cfg = self.config
+        police = self.state.police_agents[0]
+        enemy = self.state.enemy_agents[0]
+        w, h = cfg.width, cfg.height
+        ex = enemy.position[0] / w
+        ey = enemy.position[1] / h
+        dc = math.cos(enemy.direction)
+        ds = math.sin(enemy.direction)
+        rel_px = (police.position[0] - enemy.position[0]) / w
+        rel_py = (police.position[1] - enemy.position[1]) / h
+        dist_p = distance(police.position, enemy.position) / math.hypot(w, h)
+        dist_exit = nearest_exit_distance(enemy.position, w, h) / max(w, h)
+        left, right, top, bottom = distance_to_rect_edges(enemy.position, w, h)
+        wall_rays = [left / w, right / w, top / h, bottom / h]
+        t_rem = 1.0 - (self.steps / max(1, self.max_steps))
+        return np.array(
+            [ex, ey, dc, ds, rel_px, rel_py, dist_p, dist_exit, *wall_rays, t_rem],
+            dtype=np.float32,
+        )
+
+    def render(self) -> None:
+        if self.render_mode != "human" or self.state is None:
+            return
+        try:
+            import pygame
+        except ImportError:
+            return
+        cfg = self.config
+        if self._pygame_screen is None:
+            pygame.init()
+            self._pygame_screen = pygame.display.set_mode((cfg.width, cfg.height))
+            pygame.display.set_caption("ChaseEscapeEnemyEnv")
+            self._pygame_clock = pygame.time.Clock()
+        screen = self._pygame_screen
+        screen.fill((255, 255, 255))
+        # Escape zone border on all 4 edges
+        escape_band = 12
+        escape_surf = pygame.Surface((cfg.width, cfg.height), pygame.SRCALPHA)
+        escape_surf.fill((100, 255, 100, 90), (0, 0, cfg.width, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, cfg.height - escape_band, cfg.width, escape_band))
+        escape_surf.fill((100, 255, 100, 90), (0, 0, escape_band, cfg.height))
+        escape_surf.fill((100, 255, 100, 90), (cfg.width - escape_band, 0, escape_band, cfg.height))
+        screen.blit(escape_surf, (0, 0))
+        for wall in self.state.walls:
+            if len(wall.points) >= 2:
+                pygame.draw.lines(screen, (0, 0, 0), False, wall.points, wall.thickness)
+        police = self.state.police_agents[0]
+        enemy = self.state.enemy_agents[0]
+        pygame.draw.circle(screen, (0, 0, 255), (int(police.position[0]), int(police.position[1])), int(police.radius))
+        pygame.draw.circle(screen, (255, 0, 0), (int(enemy.position[0]), int(enemy.position[1])), int(enemy.radius))
+        pygame.display.flip()
+        if self._pygame_clock:
+            self._pygame_clock.tick(60)
+
+    def close(self) -> None:
+        if self._pygame_screen is not None:
+            try:
+                import pygame
                 pygame.quit()
             except ImportError:
                 pass
