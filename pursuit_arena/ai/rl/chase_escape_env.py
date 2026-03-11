@@ -34,6 +34,32 @@ from ...core.geometry import (
 from ...core.police_ai import scripted_police_chase
 from ...core.world import compute_enemy_visibility_and_danger, police_can_see_enemy, update_world
 
+# -------------------------------------------------------------------------
+# Reward configuration (can be overridden from notebooks, e.g. in Colab)
+# -------------------------------------------------------------------------
+
+# Police (ChaseEscapeEnv)
+POLICE_REWARD_ARREST: float = 5.0
+POLICE_REWARD_ESCAPE: float = -10.0
+POLICE_REWARD_VISIBLE: float = 0.05
+POLICE_PENALTY_WALL_COLLISION: float = -0.05
+POLICE_PENALTY_SPIN: float = -0.01
+POLICE_STEP_PENALTY: float = -0.002
+POLICE_TIMEOUT_PENALTY: float = -1.0
+
+# Enemy (ChaseEscapeEnemyEnv)
+ENEMY_REWARD_ESCAPE: float = 5.0
+ENEMY_REWARD_ARREST: float = -5.0
+ENEMY_PENALTY_WALL_BLOCK: float = -0.05
+ENEMY_STEP_PENALTY: float = -0.002
+ENEMY_TIMEOUT_PENALTY: float = -0.5
+
+# Strategy planner (ChaseEscapeStrategyEnv)
+STRATEGY_REWARD_ARREST: float = 5.0
+STRATEGY_REWARD_ESCAPE: float = -10.0
+STRATEGY_PENALTY_WALL_STUCK: float = -0.05
+STRATEGY_STEP_PENALTY: float = -0.002
+STRATEGY_TIMEOUT_PENALTY: float = -0.5
 
 class ChaseEscapeEnv(gym.Env):
     """
@@ -242,26 +268,31 @@ class ChaseEscapeEnv(gym.Env):
         # Small reward when police detects enemy (enemy inside FOV triangle / line-of-sight)
         enemy_visible = police_can_see_enemy(police, enemy, self.state.walls)
         if enemy_visible:
-            reward += 0.05  # small reward for keeping enemy in detection (triangle)
+            reward += POLICE_REWARD_VISIBLE  # small reward for keeping enemy in detection (triangle)
 
         # Large reward for arrest; large negative when enemy escapes
         if arrested:
-            reward += 5.0   # police gets +5 for arresting
+            reward += POLICE_REWARD_ARREST   # police gets + for arresting
         if escaped:
-            reward -= 10.0  # police gets -10 when enemy escapes (enemy achieved goal)
+            reward += POLICE_REWARD_ESCAPE  # police gets - when enemy escapes (enemy achieved goal)
 
         # Negative reward for colliding with walls (police tries to move but stays almost in place).
         moved_police = distance(old_police_pos, police.position)
         inside = 0.0 <= police.position[0] <= cfg.width and 0.0 <= police.position[1] <= cfg.height
         if forward > 0.0 and moved_police < 0.5 and inside and not (arrested or escaped):
-            reward -= 0.05
+            reward += POLICE_PENALTY_WALL_COLLISION
+
+        # Small extra penalty when police keeps rotating or doing actions without moving
+        # (discourages spinning on the spot).
+        if moved_police < 0.1 and not (arrested or escaped):
+            reward += POLICE_PENALTY_SPIN
 
         # Small step penalty to encourage efficiency
-        reward -= 0.002
+        reward += POLICE_STEP_PENALTY
 
         truncated = self.steps >= self.max_steps
         if truncated and not (arrested or escaped):
-            reward -= 1.0
+            reward += POLICE_TIMEOUT_PENALTY
 
         obs = self._get_obs()
 
@@ -678,19 +709,19 @@ class ChaseEscapeStrategyEnv(gym.Env):
         escaped = info.get("escaped", False)
         reward = 0.0
         if arrested:
-            reward += 5.0
+            reward += STRATEGY_REWARD_ARREST
         if escaped:
-            reward -= 10.0
+            reward += STRATEGY_REWARD_ESCAPE
         # Penalize strategy when police is effectively colliding with walls (tries to move but is stuck),
         # except when action is explicit HOLD (3).
         moved_police = distance(old_police_pos, self.state.police_agents[0].position)
         inside = 0.0 <= self.state.police_agents[0].position[0] <= cfg.width and 0.0 <= self.state.police_agents[0].position[1] <= cfg.height
         if a != 3 and moved_police < 0.5 and inside and not (arrested or escaped):
-            reward -= 0.05
-        reward -= 0.002
+            reward += STRATEGY_PENALTY_WALL_STUCK
+        reward += STRATEGY_STEP_PENALTY
         truncated = self.steps >= self.max_steps
         if truncated and not (arrested or escaped):
-            reward -= 0.5
+            reward += STRATEGY_TIMEOUT_PENALTY
         obs = get_strategy_obs(self.state, cfg, self.steps, self.max_steps)
         return obs, reward, terminated, truncated, {"arrested": arrested, "escaped": escaped}
 
@@ -1035,16 +1066,16 @@ class ChaseEscapeEnemyEnv(gym.Env):
         escaped = info.get("escaped", False)
         reward = 0.0
         if escaped:
-            reward += 5.0
+            reward += ENEMY_REWARD_ESCAPE
         if arrested:
-            reward -= 5.0
+            reward += ENEMY_REWARD_ARREST
         # Negative reward when enemy movement was blocked by walls (stuck).
         if enemy.blocked_last_step and not (escaped or arrested):
-            reward -= 0.05
-        reward -= 0.002
+            reward += ENEMY_PENALTY_WALL_BLOCK
+        reward += ENEMY_STEP_PENALTY
         truncated = self.steps >= self.max_steps
         if truncated and not (arrested or escaped):
-            reward -= 0.5
+            reward += ENEMY_TIMEOUT_PENALTY
         return self._get_obs(), reward, terminated, truncated, {"arrested": arrested, "escaped": escaped}
 
     def _get_obs(self) -> np.ndarray:
